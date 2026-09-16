@@ -267,9 +267,9 @@ function todayStr(){
 async function loadState(){
   let hadSaved = false;
   try{
-    const res = await window.storage.get('jaap-state', false);
-    if(res && res.value){
-      const saved = JSON.parse(res.value);
+    const raw = localStorage.getItem('jaap-state');
+    if(raw){
+      const saved = JSON.parse(raw);
       state = Object.assign(state, saved);
       hadSaved = true;
     }
@@ -296,7 +296,7 @@ async function loadState(){
 
 async function saveState(){
   try{
-    await window.storage.set('jaap-state', JSON.stringify(state), false);
+    localStorage.setItem('jaap-state', JSON.stringify(state));
   }catch(e){ console.error('save failed', e); }
 }
 
