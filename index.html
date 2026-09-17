@@ -122,10 +122,12 @@
   .sheet h3 .close{ font-size:22px; color:var(--muted); cursor:pointer; line-height:1; }
   .field{ margin-bottom:14px; }
   .field label{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
-  .field input[type=text]{
+  .field input[type=text], .field input[type=number]{
     width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--card-edge);
     background:#0e1530; color:var(--cream); font-size:15px;
   }
+  .field input[type=number]{ flex:1; width:auto; }
+  .field-hint{ font-size:11px; color:var(--muted); margin-top:6px; }
   .file-row{ display:flex; align-items:center; gap:10px; }
   .file-btn{
     padding:10px 14px; border-radius:10px; border:1px dashed var(--gold-soft); background:transparent;
@@ -205,7 +207,6 @@
     </div>
   </div>
 
-  <audio id="bhajanAudio" loop></audio>
 </div>
 
 <!-- settings sheet -->
@@ -227,6 +228,14 @@
         <button class="clear-audio" id="clearAudioBtn">Remove</button>
       </div>
       <input type="file" id="audioFile" accept="audio/*" style="display:none">
+    </div>
+    <div class="field">
+      <label>Add count from elsewhere (real mala or another app)</label>
+      <div class="file-row">
+        <input type="number" id="addCountInput" min="1" step="1" placeholder="e.g. 108">
+        <button class="file-btn" id="addCountBtn">Add</button>
+      </div>
+      <div class="field-hint">Deploys that many jaap into today's and lifetime's count.</div>
     </div>
     <div class="row">
       <button class="save" id="saveBtn">Save</button>
@@ -352,10 +361,14 @@ function playTempleBell(){
 
 function malaCompleteEffect(){
   try{ if(navigator.vibrate) navigator.vibrate(2000); }catch(e){}
-  const original = audioEl.volume === undefined ? 1 : audioEl.volume;
-  audioEl.volume = Math.max(0, original * 0.35);
-  playTempleBell();
-  setTimeout(()=>{ audioEl.volume = original; }, 2000);
+  if(gainNode && audioCtx){
+    const original = gainNode.gain.value;
+    gainNode.gain.setValueAtTime(Math.max(0, original * 0.35), audioCtx.currentTime);
+    playTempleBell();
+    setTimeout(()=>{ gainNode.gain.setValueAtTime(original, audioCtx.currentTime); }, 2000);
+  } else {
+    playTempleBell();
+  }
 }
 
 $('mainBtn').addEventListener('click', ()=>{
@@ -390,6 +403,20 @@ $('saveBtn').addEventListener('click', async ()=>{
   await saveState();
 });
 
+$('addCountBtn').addEventListener('click', async ()=>{
+  const input = $('addCountInput');
+  const n = Math.floor(Number(input.value));
+  if(!n || n <= 0) return;
+  state.today += n;
+  state.lifetime += n;
+  input.value = '';
+  render();
+  await saveState();
+  if(state.today % 108 === 0){
+    malaCompleteEffect();
+  }
+});
+
 $('pickAudioBtn').addEventListener('click', ()=> $('audioFile').click());
 $('audioFile').addEventListener('change', (e)=>{
   const file = e.target.files[0];
@@ -411,31 +438,100 @@ $('clearAudioBtn').addEventListener('click', async ()=>{
   await saveState();
 });
 
-function applyAudio(){
-  const audioEl = $('bhajanAudio');
-  if(state.audio){
-    audioEl.src = state.audio;
-  } else {
-    audioEl.removeAttribute('src');
+// ---- gapless audio via Web Audio API (avoids the pause HTML5 <audio loop> leaves between repeats) ----
+let audioCtx = null;
+let gainNode = null;
+let currentBuffer = null;
+let sourceNode = null;
+let playing = false;
+let playOffset = 0;
+let playStartTime = 0;
+let audioLoadToken = 0;
+
+function getAudioCtx(){
+  if(!audioCtx){
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 1;
+    gainNode.connect(audioCtx.destination);
+  }
+  return audioCtx;
+}
+
+async function loadAudioBuffer(dataUrl){
+  const myToken = ++audioLoadToken;
+  const ctx = getAudioCtx();
+  try{
+    const res = await fetch(dataUrl);
+    const arr = await res.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arr);
+    if(myToken === audioLoadToken) currentBuffer = buf;
+  }catch(e){
+    if(myToken === audioLoadToken) currentBuffer = null;
   }
 }
 
-let playing = false;
-const audioEl = $('bhajanAudio');
-audioEl.addEventListener('ended', ()=>{
-  if(playing){
-    audioEl.currentTime = 0;
-    audioEl.play().catch(()=>{});
+function stopAudioSource(){
+  if(sourceNode){
+    try{ sourceNode.onended = null; sourceNode.stop(); }catch(e){}
+    try{ sourceNode.disconnect(); }catch(e){}
+    sourceNode = null;
   }
-});
-$('audioToggle').addEventListener('click', ()=>{
+}
+
+function startAudioSource(offset){
+  if(!currentBuffer) return;
+  const ctx = getAudioCtx();
+  stopAudioSource();
+  sourceNode = ctx.createBufferSource();
+  sourceNode.buffer = currentBuffer;
+  sourceNode.loop = true;
+  sourceNode.connect(gainNode);
+  const dur = currentBuffer.duration || 0;
+  const safeOffset = dur ? (offset % dur) : 0;
+  sourceNode.start(0, safeOffset);
+  playStartTime = ctx.currentTime - safeOffset;
+}
+
+function pauseAudioPlayback(){
+  if(!audioCtx) return;
+  if(currentBuffer && currentBuffer.duration){
+    playOffset = (audioCtx.currentTime - playStartTime) % currentBuffer.duration;
+  }
+  stopAudioSource();
+}
+
+async function resumeAudioPlayback(){
+  const ctx = getAudioCtx();
+  if(ctx.state === 'suspended'){ try{ await ctx.resume(); }catch(e){} }
+  if(!currentBuffer && state.audio){
+    await loadAudioBuffer(state.audio);
+  }
+  startAudioSource(playOffset);
+}
+
+function applyAudio(){
+  currentBuffer = null;
+  playOffset = 0;
+  if(playing){
+    stopAudioSource();
+    playing = false;
+    $('audioToggle').textContent = '▶';
+    $('audioToggle').classList.remove('playing');
+  }
+  if(state.audio){
+    loadAudioBuffer(state.audio);
+  }
+}
+
+$('audioToggle').addEventListener('click', async ()=>{
   if(!state.audio) return;
   if(playing){
-    audioEl.pause();
+    pauseAudioPlayback();
     $('audioToggle').textContent = '▶';
     $('audioToggle').classList.remove('playing');
   } else {
-    audioEl.play().catch(()=>{});
+    await resumeAudioPlayback();
     $('audioToggle').textContent = '❚❚';
     $('audioToggle').classList.add('playing');
   }
